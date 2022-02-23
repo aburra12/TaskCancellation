@@ -1,11 +1,12 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Serilog;
 
 namespace TaskCancellation
 {
-    public static class Program
+    static class Program
     {
         public static async Task Main()
         {
@@ -14,9 +15,7 @@ namespace TaskCancellation
 
             // Store references to the tasks so that we can wait on them and
             // observe their status after cancellation.
-            Task t;
-            var tasks = new ConcurrentBag<Task>();
-
+            var taskList = new List<Task>();
             Console.WriteLine("Press any key to begin tasks...");
             Console.ReadKey(true);
             Console.WriteLine("To terminate the example, press 'c' to cancel and exit...");
@@ -25,14 +24,14 @@ namespace TaskCancellation
             // Request cancellation of a single task when the token source is canceled.
             // Pass the token to the user delegate, and also to the task so it can
             // handle the exception correctly.
-            t = Task.Run(() => DoSomeWork(1, token), token);
-            Console.WriteLine("Task {0} executing", t.Id);
-            tasks.Add(t);
+            var taskSpinWork = Task.Run(() => DoSomeSpinWork(1, token), token);
+            Console.WriteLine("Task {0} executing", taskSpinWork.Id);
+            taskList.Add(taskSpinWork);
 
             // Request cancellation of a task and its children. Note the token is passed
             // to (1) the user delegate and (2) as the second argument to Task.Run, so
             // that the task instance can correctly handle the OperationCanceledException.
-            t = Task.Run(() =>
+            Task taskCancellationTaskOfChildren = Task.Run(() =>
             {
                 // Create some cancelable child tasks.
                 Task tc;
@@ -41,17 +40,20 @@ namespace TaskCancellation
                     // For each child task, pass the same token
                     // to each user delegate and to Task.Run.
                     var i1 = i;
-                    tc = Task.Run(() => DoSomeWork(i1, token), token);
+                    tc = Task.Run(() => DoSomeSpinWork(i1, token), token);
                     Console.WriteLine("Task {0} executing", tc.Id);
-                    tasks.Add(tc);
+                    taskList.Add(tc);
                     // Pass the same token again to do work on the parent task.
                     // All will be signaled by the call to tokenSource.Cancel below.
-                    DoSomeWork(2, token);
+                    DoSomeSpinWork(2, token);
                 }
             }, token);
 
-            Console.WriteLine("Task {0} executing", t.Id);
-            tasks.Add(t);
+            await Task.Run(async () =>
+
+                await TryMultipleTask(3), token);
+            Console.WriteLine("Task {0} executing", taskCancellationTaskOfChildren.Id);
+            taskList.Add(taskCancellationTaskOfChildren);
 
             // Request cancellation from the UI thread.
             char ch = Console.ReadKey().KeyChar;
@@ -69,12 +71,12 @@ namespace TaskCancellation
             }
 
             try
-            {
-                await Task.WhenAll(tasks.ToArray());
+            { 
+                Task.WaitAll(taskList.ToArray());
             }
-            catch (OperationCanceledException)
+            catch (Exception ex)
             {
-                Console.WriteLine($"\n{nameof(OperationCanceledException)} thrown\n");
+                Log.Error(ex, "WaitTaskError");
             }
             finally
             {
@@ -82,11 +84,70 @@ namespace TaskCancellation
             }
 
             // Display status of all tasks.
-            foreach (var task in tasks)
-                Console.WriteLine("Task {0} status is now {1}", task.Id, task.Status);
+            foreach (var task in taskList)
+                Log.Information("Task {0} status is now {1}", task.Id, task.Status);
+        }
+        private static async Task TryMultipleTask(int taskNumber)
+        {
+            var tokenSource = new CancellationTokenSource();
+            var token = tokenSource.Token;
+            token.Register(() => {
+                Console.WriteLine("Token cancled.");
+            });
+
+            // Monitor keyboard input to cancel the task.
+            Task.Run(() => {
+                Console.WriteLine("Press 'C' to cancel the task.");
+                if (Console.ReadKey(true).KeyChar.ToString()
+                    .ToUpperInvariant() == "C")
+                    tokenSource.Cancel();
+            });
+
+            var tasks = new List<Task>();
+            for (var i = 0; i < taskNumber; i++)
+                tasks.Add(new RandomGenerator(i.ToString()).CreateTask(token));
+            var exceptionCreator = new ExceptionGenerator();
+            tasks.Add(exceptionCreator.CreateTask<ArgumentNullException>(nameof(taskNumber)));
+            tasks.Add(exceptionCreator.CreateTask<NotImplementedException>("A method is yet implemented."));
+            var allTasks = Task.WhenAll(tasks.ToArray());
+            await TryCancellableTask(allTasks);
+            Console.WriteLine($"Task end status : {allTasks.Status}");
         }
 
-        static void DoSomeWork(int taskNum, CancellationToken ct)
+        private static async Task TryCancellableTask(Task task) 
+        {
+            try {
+                // This statement might raise exceptions.
+                // When only one exception was raised, await throws the exception, in 
+                // this sample TimeoutException.
+                // When multiple exceptions were thrown, await throws the first exception
+                // but set the Task.Exception to an AggregateException wrapping all the
+                // exceptions thrown.
+                await task;
+            }
+            catch (OperationCanceledException) {
+                Console.WriteLine("OperationCanceledException caught...");
+            }
+            catch (TimeoutException) {
+                Console.WriteLine("TimeoutException caught...");
+            }
+            catch (Exception) {
+                Console.WriteLine("Unknown Exceptions caught");
+            }
+            ShowTaskException(task.Exception);
+        }
+
+        private static void ShowTaskException(AggregateException? age) 
+        {
+            Console.WriteLine("Task.Exception includes [");
+            age?.Handle(e => {
+                Console.WriteLine($"{{ {e.Message} }}"); 
+                return true;
+            });
+            Console.WriteLine("]");
+        }
+
+        static void DoSomeSpinWork(int taskNum, CancellationToken ct)
         {
             // Was cancellation already requested?
             if (ct.IsCancellationRequested)
